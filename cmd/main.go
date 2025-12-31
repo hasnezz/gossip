@@ -35,7 +35,7 @@ const (
 	OpDelete
 )
 
-var ClusterSecret = []byte("Hello world")
+var ClusterSecret []byte
 var log *zap.Logger
 
 type (
@@ -148,6 +148,7 @@ func (n *Node) recvloop() {
 }
 
 func (n *Node) hearbeat() {
+	// TODO: handle routine cancellation
 	for {
 		time.Sleep(HearbeatTick)
 
@@ -327,8 +328,10 @@ type StateMachine interface {
 }
 
 func main() {
+	id := flag.String("id", "", "Node ID")
 	addr := flag.String("addr", "127.0.0.1:4100", "Listen address")
 	seeds := flag.String("seed", "", "List of peer addresses")
+	secret := flag.String("secret", "123", "List of peer addresses")
 	flag.Parse()
 
 	var err error
@@ -337,6 +340,8 @@ func main() {
 		panic(err)
 	}
 	defer log.Sync()
+
+	ClusterSecret = []byte(*secret)
 
 	seedMap := map[NodeID]*Peer{}
 	for s := range strings.SplitSeq(*seeds, ",") {
@@ -348,7 +353,11 @@ func main() {
 		}
 	}
 
-	n := NewNode(NodeID(*addr), *addr, seedMap)
+	if *id == "" {
+		id = addr
+	}
+
+	n := NewNode(NodeID(*id), *addr, seedMap)
 	if err := n.Init(); err != nil {
 		panic(err)
 	}
