@@ -30,18 +30,31 @@ const (
 	MessageHeartbeat MessageType = iota
 )
 
+const (
+	OpUpdate OpType = iota
+	OpDelete
+)
+
 var ClusterSecret = []byte("Hello world")
 var log *zap.Logger
 
 type (
 	NodeID      string
 	MessageType uint32
+	OpType      uint32
 )
 
 type Peer struct {
 	ID       NodeID `json:"id"`
 	Addr     string `json:"addr"`
 	Lastseen uint64 `json:"lastseen"`
+}
+
+type GossipNode interface {
+	Init() error
+	Peers() []Peer
+	Broadcast(Message) error
+	Stop() error
 }
 
 type Node struct {
@@ -53,6 +66,8 @@ type Node struct {
 	peers   map[NodeID]*Peer
 	peersMu sync.Mutex
 }
+
+var _ GossipNode = (*Node)(nil)
 
 func NewNode(id NodeID, addr string, seed map[NodeID]*Peer) *Node {
 	return &Node{
@@ -86,16 +101,41 @@ func (n *Node) Stop() error {
 	return n.conn.Close()
 }
 
+func (n *Node) Peers() []Peer {
+	return mapValues(n.peers)
+}
+
+func (n *Node) Broadcast(m Message) error {
+	n.peersMu.Lock()
+	defer n.peersMu.Unlock()
+
+	encodedMsg, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+
+	for _, peer := range n.peers {
+		udpAddr, err := net.ResolveUDPAddr("udp", peer.Addr)
+		if err != nil {
+			log.Warn("invalid address", zap.String("addr", peer.Addr), zap.Error(err))
+			continue
+		}
+
+		n.conn.WriteTo(encodedMsg, udpAddr) // TODO: collect errors
+	}
+
+	return nil
+}
+
 func (n *Node) recvloop() {
 	buff := make([]byte, 1024*4)
 	for {
 		l, addr, err := n.conn.ReadFrom(buff)
 		if err != nil {
-			continue // skip error
+			log.Debug("failed to receive message", zap.String("toAddr", n.addr), zap.Error(err))
+			continue
 		}
 		log.Debug("received a message", zap.Int("length", l), zap.String("addr", addr.String()))
-
-		// TODO: send a message back
 
 		var msg Message
 		if err := json.Unmarshal(buff[:l], &msg); err != nil {
@@ -157,38 +197,6 @@ func (n *Node) hearbeat() {
 	}
 }
 
-func (n *Node) displayPeers() {
-	print("\033[2J\033[H")
-
-	// Header
-	fmt.Printf(
-		"%-20s %-22s %-10s %-12s\n",
-		"ID", "ADDR", "STATE", "LAST SEEN",
-	)
-	fmt.Println(strings.Repeat("-", 70))
-
-	now := time.Now()
-
-	for id, peer := range n.peers {
-		state := "DEAD"
-		if isPeerAlive(peer) {
-			state = "ALIVE"
-		}
-
-		lastSeenAgo := time.Duration(
-			now.UnixNano() - int64(peer.Lastseen),
-		).Truncate(time.Millisecond)
-
-		fmt.Printf(
-			"%-20s %-22s %-10s %-12s\n",
-			id,
-			peer.Addr,
-			state,
-			lastSeenAgo,
-		)
-	}
-}
-
 func (n *Node) handleMessage(msg Message, senderAddr net.Addr) {
 	sig, err := hex.DecodeString(msg.Sig)
 	if err != nil {
@@ -237,6 +245,38 @@ func (n *Node) handleMessage(msg Message, senderAddr net.Addr) {
 	}
 }
 
+func (n *Node) displayPeers() {
+	print("\033[2J\033[H")
+
+	// Header
+	fmt.Printf(
+		"%-20s %-22s %-10s %-12s\n",
+		"ID", "ADDR", "STATE", "LAST SEEN",
+	)
+	fmt.Println(strings.Repeat("-", 70))
+
+	now := time.Now()
+
+	for id, peer := range n.peers {
+		state := "DEAD"
+		if isPeerAlive(peer) {
+			state = "ALIVE"
+		}
+
+		lastSeenAgo := time.Duration(
+			now.UnixNano() - int64(peer.Lastseen),
+		).Truncate(time.Millisecond)
+
+		fmt.Printf(
+			"%-20s %-22s %-10s %-12s\n",
+			id,
+			peer.Addr,
+			state,
+			lastSeenAgo,
+		)
+	}
+}
+
 type Message struct {
 	Type MessageType `json:"type"`
 	Raw  string      `json:"raw"`
@@ -273,6 +313,17 @@ func mapValues(m map[NodeID]*Peer) []Peer {
 
 func isPeerAlive(peer *Peer) bool {
 	return time.Now().UnixNano()-int64(peer.Lastseen) <= HearbeatTick.Nanoseconds()*DeadPeerThreshold
+}
+
+type Command struct {
+	Op    OpType
+	Key   string
+	Value []byte
+}
+
+type StateMachine interface {
+	Apply(Command) error
+	Get(key string) ([]byte, bool)
 }
 
 func main() {
