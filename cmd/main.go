@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -15,8 +16,8 @@ import (
 )
 
 const (
-	HearbeatTick      = time.Second * 2
-	DeadPeerThreshold = time.Second * 5
+	HearbeatTick      = time.Second * 1
+	DeadPeerThreshold = 5 // missed HB's to consider peer dead
 )
 
 const (
@@ -151,12 +152,40 @@ func (n *Node) hearbeat() {
 				log.Error("failed to send heartbeat", zap.Error(err))
 			}
 		}
-
-		println("==== Peers =====")
-		for id, peer := range n.peers {
-			println(id, peer.Addr, isPeerAlive(peer))
-		}
+		n.displayPeers()
 		n.peersMu.Unlock()
+	}
+}
+
+func (n *Node) displayPeers() {
+	print("\033[2J\033[H")
+
+	// Header
+	fmt.Printf(
+		"%-20s %-22s %-10s %-12s\n",
+		"ID", "ADDR", "STATE", "LAST SEEN",
+	)
+	fmt.Println(strings.Repeat("-", 70))
+
+	now := time.Now()
+
+	for id, peer := range n.peers {
+		state := "DEAD"
+		if isPeerAlive(peer) {
+			state = "ALIVE"
+		}
+
+		lastSeenAgo := time.Duration(
+			now.UnixNano() - int64(peer.Lastseen),
+		).Truncate(time.Millisecond)
+
+		fmt.Printf(
+			"%-20s %-22s %-10s %-12s\n",
+			id,
+			peer.Addr,
+			state,
+			lastSeenAgo,
+		)
 	}
 }
 
@@ -243,7 +272,7 @@ func mapValues(m map[NodeID]*Peer) []Peer {
 }
 
 func isPeerAlive(peer *Peer) bool {
-	return time.Now().UnixNano()-int64(peer.Lastseen) <= DeadPeerThreshold.Nanoseconds()
+	return time.Now().UnixNano()-int64(peer.Lastseen) <= HearbeatTick.Nanoseconds()*DeadPeerThreshold
 }
 
 func main() {
