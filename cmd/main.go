@@ -18,7 +18,7 @@ import (
 const (
 	HearbeatTick       = time.Second * 1
 	DeadPeerThreshold  = 5 // missed HB's to consider peer dead
-	BlacklistThreshold = 3 // three illegal signatures mark the node in the blacklist
+	BlacklistThreshold = 3 // how many illegal signatures received to mark node as a blacklist member
 )
 
 const (
@@ -52,7 +52,7 @@ type Peer struct {
 }
 
 type GossipNode interface {
-	Init() error
+	Init(seed []string) error
 	Peers() []Peer
 	Broadcast(Message) error
 	Stop() error
@@ -64,6 +64,7 @@ type Node struct {
 	role      string
 	conn      net.PacketConn
 	blacklist map[string]int // addr -> illgeal tries
+	debug     bool
 
 	peers   map[NodeID]*Peer
 	peersMu sync.Mutex
@@ -71,17 +72,18 @@ type Node struct {
 
 var _ GossipNode = (*Node)(nil)
 
-func NewNode(id NodeID, addr string, seed map[NodeID]*Peer) *Node {
+func NewNode(id NodeID, addr string, debug bool) *Node {
 	return &Node{
-		id:        NodeID(addr),
+		id:        id,
 		addr:      addr,
-		peers:     seed,
 		role:      NodeFollower,
 		blacklist: map[string]int{},
+		peers:     map[NodeID]*Peer{},
+		debug:     debug,
 	}
 }
 
-func (n *Node) Init() error {
+func (n *Node) Init(seed []string) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", n.addr)
 	if err != nil {
 		log.Warn("invalid address", zap.String("addr", n.addr), zap.Error(err))
@@ -94,7 +96,29 @@ func (n *Node) Init() error {
 	}
 	log.Info("node up and running", zap.String("id", string(n.id)), zap.String("addr", n.addr))
 
-	go n.hearbeat()
+	// send HB's to seed nodes
+	for _, s := range seed {
+		if len(s) == 0 {
+			continue
+		}
+
+		addr, err := net.ResolveUDPAddr("udp", s)
+		if err != nil {
+			log.Warn("invalid seed address", zap.String("addr", s), zap.Error(err))
+			continue
+		}
+
+		payload := HBDetails{
+			ID:    n.id,
+			Addr:  n.addr,
+			Role:  n.role,
+			Peers: []Peer{},
+		}
+
+		n.heartbeatTo(payload, addr)
+	}
+
+	go n.heartbeat()
 	n.recvloop()
 
 	return nil
@@ -155,14 +179,13 @@ func (n *Node) recvloop() {
 	}
 }
 
-func (n *Node) hearbeat() {
+func (n *Node) heartbeat() {
 	// TODO: handle routine cancellation
 	for {
-		time.Sleep(HearbeatTick)
-
 		n.peersMu.Lock()
+		n.displayPeers()
 		for id, peer := range n.peers {
-			if len(id) < 3 || id == n.id {
+			if id == n.id {
 				continue
 			}
 
@@ -181,28 +204,36 @@ func (n *Node) hearbeat() {
 				Peers: mapValues(n.peers),
 			}
 
-			var encodedPayload []byte
-			if encodedPayload, err = json.Marshal(payload); err != nil {
-				log.Error("failed to serialize heartbeat payload", zap.Error(err))
-			}
-
-			msg := Message{
-				Type: MessageHeartbeat,
-				Raw:  hex.EncodeToString(encodedPayload),
-				Sig:  hex.EncodeToString(signMessage(encodedPayload)),
-			}
-
-			var encodedMessage []byte
-			if encodedMessage, err = json.Marshal(msg); err != nil {
-				log.Error("failed to serialize heartbeat message", zap.Error(err))
-			}
-
-			if _, err := n.conn.WriteTo(encodedMessage, udpAddr); err != nil {
-				log.Error("failed to send heartbeat", zap.Error(err))
-			}
+			n.heartbeatTo(payload, udpAddr)
 		}
-		n.displayPeers()
 		n.peersMu.Unlock()
+
+		time.Sleep(HearbeatTick)
+	}
+}
+
+func (n *Node) heartbeatTo(payload HBDetails, addr net.Addr) {
+	encodedPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Error("failed to serialize heartbeat payload", zap.Error(err))
+		return
+	}
+
+	msg := Message{
+		Type: MessageHeartbeat,
+		Raw:  hex.EncodeToString(encodedPayload),
+		Sig:  hex.EncodeToString(signMessage(encodedPayload)),
+	}
+
+	var encodedMessage []byte
+	if encodedMessage, err = json.Marshal(msg); err != nil {
+		log.Error("failed to serialize heartbeat message", zap.Error(err))
+		return
+	}
+
+	if _, err := n.conn.WriteTo(encodedMessage, addr); err != nil {
+		log.Error("failed to send heartbeat", zap.Error(err))
+		return
 	}
 }
 
@@ -257,9 +288,11 @@ func (n *Node) handleMessage(msg Message, senderAddr net.Addr) {
 }
 
 func (n *Node) displayPeers() {
-	if !strings.Contains(n.addr, ":") {
-		print("\033[2J\033[H")
+	if !n.debug {
+		return
 	}
+
+	print("\033[2J\033[H")
 
 	// Header
 	fmt.Printf(
@@ -344,6 +377,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:4100", "Listen address")
 	seeds := flag.String("seed", "", "List of peer addresses")
 	secret := flag.String("secret", "123", "Cluster HMAC address")
+	debug := flag.Bool("debug", true, "Debug mode")
 	flag.Parse()
 
 	var err error
@@ -355,22 +389,12 @@ func main() {
 
 	ClusterSecret = []byte(*secret)
 
-	seedMap := map[NodeID]*Peer{}
-	for s := range strings.SplitSeq(*seeds, ",") {
-		if len(s) > 0 {
-			seedMap[NodeID(s)] = &Peer{
-				ID:   NodeID(s),
-				Addr: s,
-			}
-		}
-	}
-
 	if *id == "" {
 		id = addr
 	}
 
-	n := NewNode(NodeID(*id), *addr, seedMap)
-	if err := n.Init(); err != nil {
+	n := NewNode(NodeID(*id), *addr, *debug)
+	if err := n.Init(strings.Split(*seeds, ",")); err != nil {
 		panic(err)
 	}
 }
