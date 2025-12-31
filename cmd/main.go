@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	HearbeatTick      = time.Second * 1
-	DeadPeerThreshold = 5 // missed HB's to consider peer dead
+	HearbeatTick       = time.Second * 1
+	DeadPeerThreshold  = 5 // missed HB's to consider peer dead
+	BlacklistThreshold = 3 // three illegal signatures mark the node in the blacklist
 )
 
 const (
@@ -58,10 +59,11 @@ type GossipNode interface {
 }
 
 type Node struct {
-	id   NodeID
-	addr string
-	role string
-	conn net.PacketConn
+	id        NodeID
+	addr      string
+	role      string
+	conn      net.PacketConn
+	blacklist map[string]int // addr -> illgeal tries
 
 	peers   map[NodeID]*Peer
 	peersMu sync.Mutex
@@ -71,10 +73,11 @@ var _ GossipNode = (*Node)(nil)
 
 func NewNode(id NodeID, addr string, seed map[NodeID]*Peer) *Node {
 	return &Node{
-		id:    NodeID(addr),
-		addr:  addr,
-		peers: seed,
-		role:  NodeFollower,
+		id:        NodeID(addr),
+		addr:      addr,
+		peers:     seed,
+		role:      NodeFollower,
+		blacklist: map[string]int{},
 	}
 }
 
@@ -136,6 +139,11 @@ func (n *Node) recvloop() {
 			continue
 		}
 		log.Debug("received a message", zap.Int("length", l), zap.String("addr", addr.String()))
+
+		if n.blacklist[addr.String()] >= BlacklistThreshold {
+			log.Warn("ignoring a blacklisted member", zap.String("addr", n.addr))
+			continue // ignore messages coming from blacklist members
+		}
 
 		var msg Message
 		if err := json.Unmarshal(buff[:l], &msg); err != nil {
@@ -210,7 +218,9 @@ func (n *Node) handleMessage(msg Message, senderAddr net.Addr) {
 	}
 
 	if !verifyMessage(sig, data) {
+		n.blacklist[senderAddr.String()]++
 		log.Warn("receoived invalid sig", zap.String("addr", senderAddr.String()))
+		return
 	}
 
 	switch msg.Type {
@@ -247,7 +257,9 @@ func (n *Node) handleMessage(msg Message, senderAddr net.Addr) {
 }
 
 func (n *Node) displayPeers() {
-	print("\033[2J\033[H")
+	if !strings.Contains(n.addr, ":") {
+		print("\033[2J\033[H")
+	}
 
 	// Header
 	fmt.Printf(
@@ -331,7 +343,7 @@ func main() {
 	id := flag.String("id", "", "Node ID")
 	addr := flag.String("addr", "127.0.0.1:4100", "Listen address")
 	seeds := flag.String("seed", "", "List of peer addresses")
-	secret := flag.String("secret", "123", "List of peer addresses")
+	secret := flag.String("secret", "123", "Cluster HMAC address")
 	flag.Parse()
 
 	var err error
